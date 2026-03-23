@@ -3,22 +3,7 @@ channels:
   - conda-forge
 dependencies:
   - python =3.10
-  - tifffile
-  - scikit-image
-  - scikit-learn
-  - scipy
-  - pyyaml
-  - matplotlib-base
   - numpy
+  - pandas
+  - tifffile
   - tqdm
-  - dask
-  - dask-image
-  - zarr >2
-  - pip
-  - git
-  - pip:
-      - --extra-index-url https://download.pytorch.org/whl/cu128
-      - torch==2.10.0+cu128
-      - torchvision
-      - git+https://github.com/facebookresearch/segment-anything.git
-      - git+https://github.com/vanvalenlab/cellSAM.git
