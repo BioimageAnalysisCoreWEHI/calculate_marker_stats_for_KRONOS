@@ -6,8 +6,15 @@ Nextflow pipeline for computing per-marker mean and standard deviation from COME
 
 - Recursively finds OME-TIFF files in `--image_dir` using `--pattern`.
 - Applies per-image normalization by dividing by dtype max (auto-detected or `--dtype_max`).
-- Pools normalized pixels by marker across all files.
+- Processes one image at a time and accumulates marker statistics incrementally.
+- Pools normalized pixels by marker across all files using running moments (`sum`, `sumsq`, `count`).
 - Computes `marker_mean` and `marker_std` and writes a CSV.
+
+This streaming approach avoids loading all images into memory at once while still
+producing the same global pooled mean/std as full concatenation.
+
+If one image is corrupt or triggers a low-level TIFF read crash, that file is
+skipped and processing continues for the remaining files.
 
 ## Container
 

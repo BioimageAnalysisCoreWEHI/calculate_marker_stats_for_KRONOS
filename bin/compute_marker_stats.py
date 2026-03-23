@@ -28,6 +28,8 @@ Usage:
 """
 
 import argparse
+import multiprocessing as mp
+import queue
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -123,26 +125,111 @@ def read_ome_tiff(path: Path):
 # Stats accumulation
 # ---------------------------------------------------------------------------
 
-def accumulate_pixels(image_paths: list, dtype_max_override=None):
+def _compute_file_stats(path_str: str, dtype_max_override=None):
     """
-    Iterate over all OME-TIFFs, normalize each channel by dtype max,
-    and accumulate all pixel values per marker name.
+    Compute marker-level first and second moments for a single OME-TIFF.
+    Returns:
+        marker_stats: {marker_name -> (sum, sumsq, count)}
+        max_val: dtype max used for normalization
+    """
+    path = Path(path_str)
+    image, marker_names, file_max = read_ome_tiff(path)
+    max_val = dtype_max_override if dtype_max_override is not None else file_max
+
+    marker_stats = {}
+    for ch_idx, marker in enumerate(marker_names):
+        channel = image[ch_idx].astype(np.float64, copy=False) / max_val
+        channel_sum = float(np.sum(channel, dtype=np.float64))
+        channel_sumsq = float(np.sum(np.multiply(channel, channel, dtype=np.float64), dtype=np.float64))
+        channel_count = int(channel.size)
+        marker_stats[marker] = (channel_sum, channel_sumsq, channel_count)
+
+    del image
+    return marker_stats, max_val
+
+
+def _worker_compute_file_stats(path_str: str, dtype_max_override, queue):
+    """
+    Worker entrypoint for subprocess-isolated image parsing.
+    If low-level TIFF decode crashes (e.g. SIGBUS), the parent survives and
+    can skip that file.
+    """
+    try:
+        marker_stats, max_val = _compute_file_stats(path_str, dtype_max_override)
+        queue.put({
+            "ok": True,
+            "path": path_str,
+            "marker_stats": marker_stats,
+            "max_val": max_val,
+            "error": None,
+        })
+    except Exception as e:
+        queue.put({
+            "ok": False,
+            "path": path_str,
+            "marker_stats": None,
+            "max_val": None,
+            "error": str(e),
+        })
+
+
+def accumulate_moments(image_paths: list, dtype_max_override=None):
+    """
+    Iterate over OME-TIFFs and accumulate per-marker moments:
+    sum(x), sum(x^2), n on normalized pixels x in [0, 1].
+
+    Each file is processed in an isolated subprocess so a hard crash from a
+    single bad TIFF does not terminate the whole run.
 
     Returns:
-        pixel_store : { marker_name -> list of 1-D float32 pixel arrays }
+        moment_store : { marker_name -> {sum, sumsq, count} }
         dtype_max   : the dtype max value used (for reporting / KRONOS config)
+        processed_count : number of files successfully processed
+        skipped_count   : number of files skipped due read/parse failure
     """
-    pixel_store = {}
+    moment_store = {}
     detected_max = None
+    processed_count = 0
+    skipped_count = 0
+    ctx = mp.get_context("spawn")
 
     for path in tqdm(image_paths, desc="Reading images"):
-        try:
-            image, marker_names, file_max = read_ome_tiff(path)
-        except Exception as e:
-            print(f"  [error] Skipping {path.name}: {e}")
+        queue = ctx.Queue(maxsize=1)
+        proc = ctx.Process(
+            target=_worker_compute_file_stats,
+            args=(str(path), dtype_max_override, queue),
+        )
+        proc.start()
+        proc.join()
+
+        if proc.exitcode != 0:
+            print(f"  [error] Skipping {path.name}: reader subprocess exited with code {proc.exitcode}")
+            skipped_count += 1
+            if proc.is_alive():
+                proc.terminate()
+            queue.close()
             continue
 
-        max_val = dtype_max_override if dtype_max_override is not None else file_max
+        try:
+            result = queue.get(timeout=5)
+        except queue.Empty:
+            print(f"  [error] Skipping {path.name}: reader returned no result")
+            skipped_count += 1
+            queue.close()
+            queue.join_thread()
+            continue
+
+        queue.close()
+        queue.join_thread()
+
+        if not result["ok"]:
+            print(f"  [error] Skipping {path.name}: {result['error']}")
+            skipped_count += 1
+            continue
+
+        marker_stats = result["marker_stats"]
+        max_val = result["max_val"]
+        processed_count += 1
 
         if detected_max is None:
             detected_max = max_val
@@ -150,33 +237,39 @@ def accumulate_pixels(image_paths: list, dtype_max_override=None):
             print(f"  [warn] {path.name} dtype max {max_val} differs from "
                   f"first image ({detected_max}). Use --dtype_max to fix.")
 
-        # Key normalization step: divide by dtype max → [0, 1]
-        image_norm = image.astype(np.float32) / max_val
-
-        for ch_idx, marker in enumerate(marker_names):
-            flat = image_norm[ch_idx].flatten()
-            if marker not in pixel_store:
-                pixel_store[marker] = []
-            pixel_store[marker].append(flat)
-
-        del image, image_norm
+        for marker, (channel_sum, channel_sumsq, channel_count) in marker_stats.items():
+            if marker not in moment_store:
+                moment_store[marker] = {"sum": 0.0, "sumsq": 0.0, "count": 0}
+            moment_store[marker]["sum"] += channel_sum
+            moment_store[marker]["sumsq"] += channel_sumsq
+            moment_store[marker]["count"] += channel_count
 
     final_max = dtype_max_override if dtype_max_override is not None else (detected_max or 65535.0)
-    return pixel_store, final_max
+    return moment_store, final_max, processed_count, skipped_count
 
 
-def compute_stats(pixel_store: dict) -> pd.DataFrame:
+def compute_stats(moment_store: dict) -> pd.DataFrame:
     """
-    Concatenate pooled pixels per marker and compute mean + std.
+    Compute mean/std from per-marker accumulated moments.
     """
     rows = []
-    for marker in sorted(pixel_store.keys()):
-        pixels = np.concatenate(pixel_store[marker])
+    for marker in sorted(moment_store.keys()):
+        total_sum = float(moment_store[marker]["sum"])
+        total_sumsq = float(moment_store[marker]["sumsq"])
+        total_count = int(moment_store[marker]["count"])
+
+        if total_count == 0:
+            continue
+
+        mean = total_sum / total_count
+        variance = max((total_sumsq / total_count) - (mean * mean), 0.0)
+        std = float(np.sqrt(variance))
+
         rows.append({
             "marker_name": marker,
-            "marker_mean": round(float(np.mean(pixels)), 6),
-            "marker_std":  round(float(np.std(pixels)),  6),
-            "n_pixels":    int(len(pixels)),
+            "marker_mean": round(float(mean), 6),
+            "marker_std":  round(float(std),  6),
+            "n_pixels":    total_count,
         })
     return pd.DataFrame(rows)
 
@@ -226,9 +319,23 @@ def main():
     for p in image_paths:
         print(f"  {p}")
 
-    # Accumulate pixels and compute stats
-    pixel_store, dtype_max = accumulate_pixels(image_paths, args.dtype_max)
-    stats_df = compute_stats(pixel_store)
+    # Accumulate moments and compute stats
+    moment_store, dtype_max, processed_count, skipped_count = accumulate_moments(
+        image_paths,
+        args.dtype_max,
+    )
+
+    if not moment_store:
+        raise RuntimeError(
+            "No readable OME-TIFF files were processed. "
+            "Check file integrity and try a narrower --pattern."
+        )
+
+    stats_df = compute_stats(moment_store)
+
+    print(f"\nProcessed files: {processed_count}")
+    if skipped_count > 0:
+        print(f"Skipped files:   {skipped_count} (see [error] lines above)")
 
     print(f"\nNormalization: raw pixel / {dtype_max}")
     print(f"=> Set 'marker_max_values': {dtype_max} in your KRONOS inference config.\n")
